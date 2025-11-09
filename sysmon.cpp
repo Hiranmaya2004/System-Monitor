@@ -1,109 +1,171 @@
-// Day 4: sysmon.cpp
-// Build: g++ -std=c++17 sysmon.cpp -o sysmon
+// Day 5: sysmon.cpp
+// Build: g++ -std=c++17 sysmon.cpp -o sysmon -lncurses
+// Run: ./sysmon [interval_seconds]
 
 #include <bits/stdc++.h>
+#include <ncurses.h>
 #include <signal.h>
-#include <errno.h>
 using namespace std;
 namespace fs = filesystem;
 
-struct ProcInfo {
+struct ProcSnapshot {
     int pid;
     string name;
-    unsigned long utime=0;
-    unsigned long stime=0;
-    long rss_kb=0;
-    unsigned long total_time() const { return utime + stime; }
+    unsigned long total_time = 0; // utime+stime (jiffies)
+    long rss_kb = 0;
+    double cpu_percent = 0.0;
+    double mem_mb = 0.0;
 };
+
+unsigned long get_total_jiffies() {
+    ifstream f("/proc/stat");
+    string line;
+    getline(f, line);
+    // line: cpu  3357 0 4313 1362393 ...
+    stringstream ss(line);
+    string cpu; unsigned long v, sum=0;
+    ss >> cpu;
+    while (ss >> v) sum += v;
+    return sum;
+}
 
 vector<int> list_pids() {
     vector<int> pids;
-    for (const auto &entry : fs::directory_iterator("/proc")) {
-        string name = entry.path().filename();
+    for (auto &e : fs::directory_iterator("/proc")) {
+        string name = e.path().filename();
         if (!name.empty() && all_of(name.begin(), name.end(), ::isdigit))
             pids.push_back(stoi(name));
     }
-    sort(pids.begin(), pids.end());
     return pids;
 }
 
-ProcInfo read_proc(int pid) {
-    ProcInfo p; p.pid = pid;
-    string statpath = "/proc/" + to_string(pid) + "/stat";
-    ifstream sf(statpath);
-    if (sf) {
-        string content; getline(sf, content);
-        size_t rp = content.rfind(')');
-        p.name = content.substr(content.find(' ')+1, rp - content.find(' ') - 1);
-        string after = content.substr(rp+2);
-        vector<string> toks; string t;
-        stringstream s(after);
-        while (s >> t) toks.push_back(t);
-        if (toks.size() >= 13) { p.utime = stoul(toks[11]); p.stime = stoul(toks[12]); }
-    }
-    string statuspath = "/proc/" + to_string(pid) + "/status";
-    ifstream pf(statuspath);
+bool read_proc_times(int pid, unsigned long &totaltime, long &rss_kb, string &name) {
+    string statp = "/proc/" + to_string(pid) + "/stat";
+    ifstream sf(statp);
+    if (!sf) return false;
+    string content; getline(sf, content);
+    size_t rp = content.rfind(')');
+    if (rp == string::npos) return false;
+    name = content.substr(content.find(' ')+1, rp - content.find(' ') - 1);
+    string after = content.substr(rp+2);
+    vector<string> toks; string t; stringstream s(after);
+    while (s >> t) toks.push_back(t);
+    if (toks.size() < 13) return false;
+    unsigned long utime = stoul(toks[11]);
+    unsigned long stime = stoul(toks[12]);
+    totaltime = utime + stime;
+
+    // rss from /proc/[pid]/status
+    rss_kb = 0;
+    ifstream pf("/proc/" + to_string(pid) + "/status");
     string line;
-    while (pf && getline(pf, line)) {
+    while (pf && getline(pf,line)) {
         if (line.rfind("VmRSS:",0) == 0) {
-            stringstream ss(line); string key; long val; string unit;
-            ss >> key >> val >> unit;
-            p.rss_kb = val;
+            string key; long val; string unit;
+            stringstream ss(line); ss >> key >> val >> unit;
+            rss_kb = val;
             break;
         }
     }
-    return p;
-}
-
-void print_header(const string &sortmode) {
-    cout << "=== System Monitor (Day 4) - sorted by " << sortmode << " ===\n\n";
-    cout << left << setw(8) << "PID" << setw(25) << "NAME" << setw(12) << "CPU_jiff" << setw(12) << "RSS(kB)" << "\n";
-    cout << string(70,'-') << "\n";
+    return true;
 }
 
 int main(int argc, char** argv) {
-    string sortmode = "cpu";
-    for (int i=1;i<argc;i++) {
-        string a = argv[i];
-        if (a.rfind("--sort=",0) == 0) sortmode = a.substr(7);
-    }
+    int interval = 2;
+    if (argc >= 2) interval = stoi(argv[1]);
+    bool sort_by_cpu = true;
 
-    vector<ProcInfo> procs;
-    for (int pid : list_pids()) procs.push_back(read_proc(pid));
+    initscr();
+    cbreak();
+    noecho();
+    nodelay(stdscr, TRUE); // non-blocking getch
+    keypad(stdscr, TRUE);
 
-    if (sortmode == "mem")
-        sort(procs.begin(), procs.end(), [](auto &a, auto &b){ return a.rss_kb > b.rss_kb; });
-    else
-        sort(procs.begin(), procs.end(), [](auto &a, auto &b){ return a.total_time() > b.total_time(); });
+    // We'll keep previous snapshots in maps
+    unordered_map<int, unsigned long> prev_proc_time;
+    unsigned long prev_total_jiffies = get_total_jiffies();
 
-    print_header(sortmode);
-    int shown=0;
-    for (auto &p : procs) {
-        if (p.pid==0) continue;
-        cout << setw(8) << p.pid << setw(25) << p.name << setw(12) << p.total_time() << setw(12) << p.rss_kb << "\n";
-        if (++shown>=40) break;
-    }
+    while (true) {
+        unsigned long cur_total_jiffies = get_total_jiffies();
 
-    cout << "\nCommands:\n  k <PID>  -> send SIGTERM to PID\n  K <PID>  -> send SIGKILL to PID\n  q        -> quit\n";
-    cout << "> ";
-    string cmd;
-    while (getline(cin, cmd)) {
-        stringstream ss(cmd);
-        string op; int pid;
-        ss >> op;
-        if (op == "q") break;
-        if ((op == "k" || op == "K") && (ss >> pid)) {
-            int sig = (op == "K") ? SIGKILL : SIGTERM;
-            if (kill(pid, sig) == 0) {
-                cout << "Signal " << sig << " sent to PID " << pid << "\n";
-            } else {
-                cout << "Failed to send signal to " << pid << " : " << strerror(errno) << "\n";
-            }
-        } else {
-            cout << "Unknown command\n";
+        vector<ProcSnapshot> procs;
+
+        for (int pid : list_pids()) {
+            unsigned long ttime;
+            long rss;
+            string name;
+            if (!read_proc_times(pid, ttime, rss, name)) continue;
+            ProcSnapshot ps;
+            ps.pid = pid; ps.name = name; ps.total_time = ttime; ps.rss_kb = rss; ps.mem_mb = rss/1024.0;
+            auto it = prev_proc_time.find(pid);
+            unsigned long proc_prev = (it!=prev_proc_time.end()) ? it->second : 0;
+            unsigned long proc_delta = (ttime >= proc_prev) ? (ttime - proc_prev) : 0;
+            unsigned long total_delta = (cur_total_jiffies >= prev_total_jiffies) ? (cur_total_jiffies - prev_total_jiffies) : 1;
+            ps.cpu_percent = 100.0 * (double)proc_delta / (double)total_delta;
+            procs.push_back(ps);
+            // update temp map later
         }
-        cout << "> ";
+
+        // update previous maps
+        prev_proc_time.clear();
+        for (auto &p : procs) prev_proc_time[p.pid] = p.total_time;
+        prev_total_jiffies = cur_total_jiffies;
+
+        if (sort_by_cpu) {
+            sort(procs.begin(), procs.end(), [](auto &a, auto &b){ return a.cpu_percent > b.cpu_percent; });
+        } else {
+            sort(procs.begin(), procs.end(), [](auto &a, auto &b){ return a.mem_mb > b.mem_mb; });
+        }
+
+        // Render
+        erase();
+        mvprintw(0,0,"SysMon (Day 5) - refresh every %d s - sort by %s - press 's' to toggle sort, 'k' to kill PID, 'q' to quit", interval, sort_by_cpu ? "CPU" : "MEM");
+        mvprintw(1,0,"%-6s %-20s %-8s %-8s", "PID", "NAME", "CPU%", "MEM(MB)");
+        int row = 2;
+        int show = 0;
+        for (auto &p : procs) {
+            if (show++ >= 25) break;
+            mvprintw(row++, 0, "%-6d %-20s %7.2f %-8.1f", p.pid, p.name.c_str(), p.cpu_percent, p.mem_mb);
+        }
+        refresh();
+
+        // handle keys
+        int ch;
+        bool killedSomething = false;
+        for (int t=0; t<interval*10; ++t) { // poll every 100ms to be responsive to keypress
+            ch = getch();
+            if (ch == 'q') {
+                endwin();
+                return 0;
+            } else if (ch == 's') {
+                sort_by_cpu = !sort_by_cpu;
+                break; // break to refresh immediately
+            } else if (ch == 'k') {
+                // prompt user for PID
+                echo();
+                nodelay(stdscr, FALSE);
+                mvprintw(row+1, 0, "Enter PID to kill (SIGTERM): ");
+                char buf[32];
+                getnstr(buf, 31);
+                int pid = atoi(buf);
+                int res = kill(pid, SIGTERM);
+                if (res == 0) mvprintw(row+2,0,"SIGTERM sent to %d", pid);
+                else mvprintw(row+2,0,"Failed to kill %d: %s", pid, strerror(errno));
+                noecho();
+                nodelay(stdscr, TRUE);
+                killedSomething = true;
+                break;
+            } else if (ch == ERR) {
+                // no input
+            }
+            napms(100); // 100 ms
+        }
+        if (killedSomething) {
+            // immediate refresh in next loop iteration
+            continue;
+        }
     }
 
+    endwin();
     return 0;
 }
