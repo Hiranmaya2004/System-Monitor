@@ -1,0 +1,3 @@
+# Ignore VSCode and history folders
+.vscode/
+.history/
